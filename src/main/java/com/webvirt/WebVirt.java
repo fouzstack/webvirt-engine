@@ -7,8 +7,6 @@ import android.webkit.WebView;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
-// [DEV] Descomentar para activar métricas:
-// import com.fouzstack.jsinterface.managers.WebVirtMetrics;
 import com.webvirt.loader.WebVirtFileLoader;
 import com.webvirt.loader.PathHandler;
 
@@ -16,7 +14,7 @@ import java.io.ByteArrayInputStream;
 import java.util.*;
 
 /**
-* WebVirt v3.1.1 — Hybrid Web Runtime Engine for Android
+* WebVirt v3.2.0 — Hybrid Web Runtime Engine for Android
 * Powered by WebVirtFileLoader
 *
 * Production Hardened:
@@ -26,9 +24,10 @@ import java.util.*;
 * - Control de memoria real
 * - ETag/304 soportado
 * - Navegación SPA con reinicio de callbacks
-* - Métricas opcionales vía WebVirtMetrics (solo si ENABLED=true)
+* - Métricas vía Strategy Pattern (WebVirtMetricsCollector)
+* - WebVirtMetricsCollector.NOOP como default (cero overhead)
 *
-* @version 3.1.1
+* @version 3.2.0
 */
 public class WebVirt {
 	private static final String TAG = "WebVirt";
@@ -55,6 +54,9 @@ public class WebVirt {
 	
 	private WebVirtPageListener pageListener;
 	private JSBridge jsBridge;
+	
+	// v3.2.0: Collector de métricas (NOOP por defecto = cero overhead)
+	private WebVirtMetricsCollector metricsCollector = WebVirtMetricsCollector.NOOP;
 	
 	// ==================== CONSTRUCTOR ====================
 	private WebVirt(@NonNull Context context) {
@@ -165,6 +167,37 @@ public class WebVirt {
 		return this;
 	}
 	
+	// v3.2.0: Métodos de métricas
+	
+	/**
+	* Inyecta un collector de métricas personalizado.
+	* Útil para enviar métricas a Firebase, Datadog, etc.
+	*
+	* @param collector Implementación de WebVirtMetricsCollector
+	* @return this para encadenamiento
+	* @see WebVirtMetricsCollector
+	* @see WebVirtMetrics
+	*/
+	public WebVirt withMetricsCollector(@NonNull WebVirtMetricsCollector collector) {
+		if (collector != null) {
+			this.metricsCollector = collector;
+		}
+		return this;
+	}
+	
+	/**
+	* Activa/desactiva las métricas usando la implementación por defecto
+	* (WebVirtMetrics con LoggingUtil).
+	*
+	* @param enabled true para activar, false para desactivar
+	* @return this para encadenamiento
+	* @see WebVirtMetrics
+	*/
+	public WebVirt withMetrics(boolean enabled) {
+		this.metricsCollector = enabled ? new WebVirtMetrics() : WebVirtMetricsCollector.NOOP;
+		return this;
+	}
+	
 	// ==================== RUTAS VIRTUALES ====================
 	
 	/**
@@ -258,7 +291,7 @@ public class WebVirt {
 		
 		this.webView = webView;
 		
-		// Crear WebVirtFileLoader con configuración completa
+		// v3.2.0: Inyectar metricsCollector en el fileLoader
 		fileLoader = new WebVirtFileLoader.Builder(context)
 		.setDomain(host)
 		.setDebugMode(debugMode)
@@ -266,6 +299,7 @@ public class WebVirt {
 		.setMaxFileSize(maxFileSize)
 		.setMaxCacheSize(maxCacheSize)
 		.setCspPolicy(cspPolicy)
+		.setMetricsCollector(metricsCollector)
 		.build();
 		
 		// Handler para assets locales
@@ -311,7 +345,6 @@ public class WebVirt {
 	*/
 	public void destroy() {
 		if (webView != null) {
-			// Desregistrar clientes antes de nullificar
 			webView.setWebViewClient(new android.webkit.WebViewClient());
 			webView.setWebChromeClient(new android.webkit.WebChromeClient());
 		}
@@ -381,50 +414,42 @@ public class WebVirt {
 		return offlineOnly;
 	}
 	
+	// v3.2.0: Getter para el collector de métricas
+	/** @return El collector de métricas actual (nunca null) */
+	@NonNull
+	public WebVirtMetricsCollector getMetricsCollector() {
+		return metricsCollector;
+	}
+	
 	// ==================== INTERNO ====================
 	
-	/**
-	* Aplica configuración recomendada de WebSettings para SPAs
-	*/
 	private void applyWebViewSettings(WebView webView) {
 		android.webkit.WebSettings s = webView.getSettings();
 		
-		// Rendimiento
 		s.setJavaScriptEnabled(true);
 		s.setDomStorageEnabled(true);
 		s.setDatabaseEnabled(true);
-		
-		// Acceso a archivos
 		s.setAllowFileAccess(true);
 		s.setAllowContentAccess(true);
-		
-		// Viewport y zoom
 		s.setLoadWithOverviewMode(true);
 		s.setUseWideViewPort(true);
 		s.setTextZoom(100);
 		s.setSupportZoom(false);
 		s.setBuiltInZoomControls(false);
 		s.setDisplayZoomControls(false);
-		
-		// Seguridad
 		s.setMixedContentMode(android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW);
 		s.setCacheMode(android.webkit.WebSettings.LOAD_DEFAULT);
 		
-		// Safe Browsing (Android 8+)
 		if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
 			s.setSafeBrowsingEnabled(true);
 		}
 		
-		// Cookies
 		android.webkit.CookieManager.getInstance().setAcceptCookie(true);
 		if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
 			android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
 		}
 	}
 	
-	/**
-	* Normaliza una ruta para comparación consistente
-	*/
 	private String normalizePath(String path) {
 		if (path == null) return "/";
 		
@@ -432,27 +457,19 @@ public class WebVirt {
 		if (!p.startsWith("/")) p = "/" + p;
 		if (p.length() > 1 && p.endsWith("/")) p = p.substring(0, p.length() - 1);
 		
-		// Remover query string
 		int q = p.indexOf('?');
 		if (q > 0) p = p.substring(0, q);
 		
-		// Remover fragment
 		int f = p.indexOf('#');
 		if (f > 0) p = p.substring(0, f);
 		
 		return p;
 	}
 	
-	/**
-	* Log condicional según debugMode
-	*/
 	private void log(String msg) {
 		if (debugMode) Log.d(TAG, msg);
 	}
 	
-	/**
-	* Imprime configuración inicial
-	*/
 	private void logConfig() {
 		Log.d(TAG, "╔══════════════════════════════════════════╗");
 		Log.d(TAG, "║     " + WebVirtVersion.FULL + " Initialized           ║");
@@ -467,19 +484,13 @@ public class WebVirt {
 		Log.d(TAG, "║ Routes:  " + String.format("%-32s", routes.size()) + "║");
 		Log.d(TAG, "║ Bridge:  " + String.format("%-32s", jsBridge != null ? "YES" : "NO") + "║");
 		Log.d(TAG, "║ CSP:     " + String.format("%-32s", "custom") + "║");
+		Log.d(TAG, "║ Metrics: " + String.format("%-32s",
+		metricsCollector == WebVirtMetricsCollector.NOOP ? "OFF" : "ON") + "║");
 		Log.d(TAG, "╚══════════════════════════════════════════╝");
 	}
 	
 	// ==================== WEBVIEW CLIENT ====================
 	
-	/**
-	* Cliente WebView interno que maneja:
-	* - Seguridad (offline, dominios)
-	* - Rutas virtuales
-	* - Assets con WebVirtFileLoader
-	* - SPA fallback (con métrica opcional)
-	* - JSBridge injection (en cada navegación)
-	*/
 	private class VirtualHostClient extends android.webkit.WebViewClient {
 		
 		private String lastReadyUrl = null;
@@ -546,8 +557,7 @@ public class WebVirt {
 			// 6. SPA FALLBACK: Rutas sin extensión → index.html
 			if (!path.contains(".") && !path.endsWith("/index.html")) {
 				log("🔄 SPA Fallback: " + path + " → index.html");
-				// [DEV] Descomentar para métricas:
-				// WebVirtMetrics.recordSpaFallback();
+				metricsCollector.recordSpaFallback();
 				return fileLoader.shouldInterceptRequest(createIndexRequest(request));
 			}
 			
@@ -593,8 +603,6 @@ public class WebVirt {
 				" for " + request.getUrl());
 			}
 		}
-		
-		// ==================== HELPERS ====================
 		
 		private RouteHandler findRoute(String path) {
 			String normalized = normalizePath(path);

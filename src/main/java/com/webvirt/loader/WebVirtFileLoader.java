@@ -11,8 +11,7 @@ import android.util.Log;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 
-// [DEV] Descomentar para activar métricas:
-// import com.fouzstack.jsinterface.managers.WebVirtMetrics;
+import com.webvirt.WebVirtMetricsCollector;
 
 import java.io.*;
 import java.net.URLDecoder;
@@ -25,11 +24,13 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
-* WebVirtFileLoader v3.1.1 — Production Hardened Final
+* WebVirtFileLoader v3.2.3 — Production Ready
 *
-* v3.1.1 Correcciones:
-* - statusCode validado en enrichResponse
-* - Métricas opcionales con WebVirtMetrics (solo si ENABLED = true)
+* v3.2.3 Cambios:
+* - cacheResponse() llama ANTES de enrichResponse() (stream preservado)
+* - Métricas vía Strategy Pattern (WebVirtMetricsCollector)
+* - WebVirtMetricsCollector.NOOP como default (cero overhead)
+* - Sin logs de depuración (código limpio)
 */
 public class WebVirtFileLoader {
 	
@@ -50,6 +51,8 @@ public class WebVirtFileLoader {
 	private final int cacheEntries;
 	private final String cspPolicy;
 	private final boolean mergeHeaders;
+	
+	private final WebVirtMetricsCollector metricsCollector;
 	
 	private static final ThreadLocal<SimpleDateFormat> HTTP_DATE_FORMAT =
 	new ThreadLocal<SimpleDateFormat>() {
@@ -76,6 +79,7 @@ public class WebVirtFileLoader {
 		this.cacheEntries = builder.cacheEntries;
 		this.cspPolicy = builder.cspPolicy;
 		this.mergeHeaders = builder.mergeHeaders;
+		this.metricsCollector = builder.metricsCollector;
 	}
 	
 	// ==================== BUILDER ====================
@@ -98,6 +102,8 @@ public class WebVirtFileLoader {
 		"font-src 'self' data:; " +
 		"media-src 'self' data: blob:; " +
 		"connect-src 'self' data: blob:;";
+		
+		private WebVirtMetricsCollector metricsCollector = WebVirtMetricsCollector.NOOP;
 		
 		public Builder(Context context) {
 			this.context = context.getApplicationContext();
@@ -146,6 +152,13 @@ public class WebVirtFileLoader {
 			return this;
 		}
 		
+		public Builder setMetricsCollector(WebVirtMetricsCollector collector) {
+			if (collector != null) {
+				this.metricsCollector = collector;
+			}
+			return this;
+		}
+		
 		public WebVirtFileLoader build() {
 			return new WebVirtFileLoader(this);
 		}
@@ -170,8 +183,9 @@ public class WebVirtFileLoader {
 	}
 	
 	public WebResourceResponse shouldInterceptRequest(WebResourceRequest request) {
-		// [DEV] Inicio de medición de tiempo (descomentar para activar métricas)
-		// long startTime = WebVirtMetrics.ENABLED ? SystemClock.elapsedRealtime() : 0;
+		long startTime = SystemClock.elapsedRealtime();
+		boolean fromCache = false;
+		long fileSize = 0;
 		
 		Uri uri = request.getUrl();
 		
@@ -201,13 +215,9 @@ public class WebVirtFileLoader {
 		String ifModifiedSince  = getRequestHeader(request, "If-Modified-Since");
 		
 		if (rangeHeader != null) {
-			// [DEV] Descomentar para métricas:
-			// WebVirtMetrics.recordRangeRequest();
+			metricsCollector.recordRangeRequest();
 			return handleRangeRequest(path, rangeHeader, request);
 		}
-		
-		// [DEV] Descomentar para métricas:
-		// boolean fromCache = false;
 		
 		if (isCacheableStatic(path)) {
 			CacheManager.CacheEntry cached = cacheManager.getEntry(path);
@@ -217,8 +227,8 @@ public class WebVirtFileLoader {
 						Date ifModifiedDate = HTTP_DATE_FORMAT.get().parse(ifModifiedSince);
 						if (cached.lastModified <= ifModifiedDate.getTime()) {
 							log("📅 304 Not Modified (If-Modified-Since): " + path);
-							// [DEV] Métricas: 304 cuenta como cache hit
-							// recordMetrics(path, startTime, true, 0);
+							metricsCollector.recordAssetLoad(path,
+							SystemClock.elapsedRealtime() - startTime, true, 0);
 							return create304Response(cached.etag, cached.lastModified);
 						}
 						} catch (ParseException e) {
@@ -228,19 +238,20 @@ public class WebVirtFileLoader {
 				
 				if (ifNoneMatch != null && ifNoneMatch.equals(cached.etag)) {
 					log("🏷️ 304 Not Modified (ETag): " + path);
-					// [DEV] Métricas: 304 cache hit
-					// recordMetrics(path, startTime, true, 0);
+					metricsCollector.recordAssetLoad(path,
+					SystemClock.elapsedRealtime() - startTime, true, 0);
 					return create304Response(cached.etag, cached.lastModified);
 				}
 				
 				log("💾 Cache hit: " + path);
-				// [DEV] Descomentar para métricas:
-				// fromCache = true;
+				fromCache = true;
 				
 				WebResourceResponse response = cached.toResponse();
-				// [DEV] Métricas con tamaño de archivo:
-				// long fileSize = cached.data != null ? cached.data.length : 0;
-				// recordMetrics(path, startTime, true, fileSize);
+				if (response != null) {
+					fileSize = cached.data != null ? cached.data.length : 0;
+					metricsCollector.recordAssetLoad(path,
+					SystemClock.elapsedRealtime() - startTime, true, fileSize);
+				}
 				return response;
 			}
 		}
@@ -254,45 +265,44 @@ public class WebVirtFileLoader {
 			WebResourceResponse response = handler.handle(path, request);
 			
 			if (response != null) {
-				response = enrichResponse(response, path);
-				
 				if (isCacheableStatic(path)
-				&& response != null
+				&& !fromCache
 				&& response.getData() instanceof ByteArrayInputStream) {
+					
+					ByteArrayInputStream bais = (ByteArrayInputStream) response.getData();
+					try {
+						fileSize = bais.available();
+						
+					} catch (Exception e) {
+					log("❌ Error cargando: " + path + " - " + e.getMessage());
+					metricsCollector.recordHttpError();
+					return createErrorResponse(500, "Internal Server Error");
+				}
+					
 					cacheResponse(path, response);
 				}
 				
-				// [DEV] Métricas: calcular tamaño del stream
-				// long fileSize = 0;
-				// if (response.getData() instanceof ByteArrayInputStream) {
-				//     try {
-				//         fileSize = response.getData().available();
-				//     } catch (IOException e) {
-				//         // Ignorar
-				//     }
-				// }
-				// recordMetrics(path, startTime, fromCache, fileSize);
+				response = enrichResponse(response, path);
+				
+				if (!fromCache && fileSize == 0 && response.getData() instanceof ByteArrayInputStream) {
+					try {
+						fileSize = response.getData().available();
+						} catch (IOException e) {
+						// Ignorar
+					}
+				}
+				
+				metricsCollector.recordAssetLoad(path,
+				SystemClock.elapsedRealtime() - startTime, false, fileSize);
 			}
 			
 			return response;
-			} catch (IOException e) {
+			} catch (Exception e) {
 			log("❌ Error cargando: " + path + " - " + e.getMessage());
-			// [DEV] Descomentar para métricas:
-			// WebVirtMetrics.recordHttpError();
+			metricsCollector.recordHttpError();
 			return createErrorResponse(500, "Internal Server Error");
 		}
 	}
-	
-	// [DEV] Método de métricas comentado (descomentar para desarrollo)
-	// /**
-	//  * Registra métricas de carga de asset (solo si WebVirtMetrics.ENABLED = true).
-	//  */
-	// private void recordMetrics(String path, long startTime, boolean fromCache, long fileSize) {
-	//     if (!WebVirtMetrics.ENABLED || startTime == 0) return;
-	//
-	//     long loadTime = SystemClock.elapsedRealtime() - startTime;
-	//     WebVirtMetrics.recordAssetLoad(path, loadTime, fromCache, fileSize);
-	// }
 	
 	// ==================== RANGE REQUESTS ====================
 	
@@ -396,14 +406,13 @@ public class WebVirtFileLoader {
 		if (!enrichedHeaders.containsKey("Content-Length")) {
 			InputStream data = original.getData();
 			if (data instanceof ByteArrayInputStream) {
-				int available = 0;
 				try {
-					available = data.available();
+					int available = data.available();
+					if (available > 0) {
+						enrichedHeaders.put("Content-Length", String.valueOf(available));
+					}
 					} catch (IOException e) {
 					// Ignorar
-				}
-				if (available > 0) {
-					enrichedHeaders.put("Content-Length", String.valueOf(available));
 				}
 			}
 		}
@@ -482,7 +491,7 @@ public class WebVirtFileLoader {
 			}
 			
 			if (data.length > 5 * 1024 * 1024) {
-				log("⚠️ Archivo muy grande para cache: " + path);
+				log("⚠️ Archivo muy grande para cache: " + path + " (" + data.length + " bytes)");
 				bais.reset();
 				return;
 			}
@@ -544,8 +553,7 @@ public class WebVirtFileLoader {
 	}
 	
 	private WebResourceResponse createErrorResponse(int code, String message) {
-		// [DEV] Descomentar para métricas:
-		// WebVirtMetrics.recordHttpError();
+		metricsCollector.recordHttpError();
 		
 		String html =
 		"<!DOCTYPE html>\n" +
