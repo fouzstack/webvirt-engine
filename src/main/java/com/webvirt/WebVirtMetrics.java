@@ -1,333 +1,452 @@
 package com.webvirt;
 
 import android.content.Context;
-import android.os.SystemClock;
+import android.util.Log;
+
+import androidx.annotation.NonNull;
 
 import com.webvirt.utils.LoggingUtil;
+
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.LinkedHashMap;
+import java.util.Date;
 import java.util.List;
-import java.util.Map;
+import java.util.Locale;
+import java.util.TimeZone;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
-/**
- * Implementación por defecto de las métricas de WebVirt.
- * Usa LoggingUtil para guardar el reporte en Documents.
- * 
- * <h3>Activación:</h3>
- * <pre>
- * WebVirt.with(context)
- *     .withMetrics(true)   // Activa esta implementación
- *     .bind(webView);
- * </pre>
- * 
- * <h3>Uso manual:</h3>
- * <pre>
- * WebVirtMetrics metrics = new WebVirtMetrics();
- * WebVirt.with(context)
- *     .withMetricsCollector(metrics)
- *     .bind(webView);
- * // Más tarde:
- * String report = metrics.generateReport(context);
- * </pre>
- */
 public class WebVirtMetrics implements WebVirtMetricsCollector {
-
-    private static final int MAX_RECENT_LOADS = 200;
-
-    // ==================== ESTADO (todo de instancia, sin static) ====================
-
-    private long sessionStartTime = 0;
-    private long sessionEndTime = 0;
-    private long totalBytesLoaded = 0;
-    private long totalBytesFromCache = 0;
-    private int totalCacheHits = 0;
-    private int totalCacheMisses = 0;
-    private int totalAssetsLoaded = 0;
-    private long totalLoadTimeMs = 0;
-    private long minLoadTimeMs = Long.MAX_VALUE;
-    private long maxLoadTimeMs = 0;
-    private int httpErrors = 0;
-    private int spaFallbacks = 0;
-    private int rangeRequests = 0;
-
-    // Contadores por tipo MIME
-    private final Map<String, Integer> assetsByType = new LinkedHashMap<>();
-    private final Map<String, Long> loadTimeByType = new LinkedHashMap<>();
-
-    // Últimas cargas para análisis detallado
-    private final List<AssetLoadRecord> recentLoads =
-        Collections.synchronizedList(new ArrayList<>());
-
-    // ==================== API PÚBLICA ====================
-
-    @Override
-    public void startSession() {
-        reset();
-        sessionStartTime = SystemClock.elapsedRealtime();
-    }
-
-    @Override
-    public void endSession() {
-        sessionEndTime = SystemClock.elapsedRealtime();
-    }
-
-    @Override
-    public void recordAssetLoad(String path, long loadTimeMs,
-                                boolean fromCache, long fileSize) {
-        totalAssetsLoaded++;
-        totalLoadTimeMs += loadTimeMs;
-        totalBytesLoaded += fileSize;
-
-        if (fromCache) {
-            totalCacheHits++;
-            totalBytesFromCache += fileSize;
-        } else {
-            totalCacheMisses++;
-        }
-
-        // Min/Max
-        if (loadTimeMs < minLoadTimeMs) minLoadTimeMs = loadTimeMs;
-        if (loadTimeMs > maxLoadTimeMs) maxLoadTimeMs = loadTimeMs;
-
-        // Por tipo MIME
-        String mimeType = extractMimeType(path);
-        synchronized (assetsByType) {
-            assetsByType.merge(mimeType, 1, Integer::sum);
-            loadTimeByType.merge(mimeType, loadTimeMs, Long::sum);
-        }
-
-        // Registro detallado
-        synchronized (recentLoads) {
-            recentLoads.add(new AssetLoadRecord(path, mimeType, loadTimeMs, fromCache, fileSize));
-            if (recentLoads.size() > MAX_RECENT_LOADS) {
-                recentLoads.remove(0);
-            }
-        }
-    }
-
-    @Override
-    public void recordHttpError() {
-        httpErrors++;
-    }
-
-    @Override
-    public void recordSpaFallback() {
-        spaFallbacks++;
-    }
-
-    @Override
-    public void recordRangeRequest() {
-        rangeRequests++;
-    }
-
-    // ==================== REPORTE ====================
-
-    @Override
-    public String generateReport(Context context) {
-        StringBuilder report = new StringBuilder();
-
-        long sessionDuration = getSessionDuration();
-
-        report.append("\n");
-        report.append("╔══════════════════════════════════════════════════╗\n");
-        report.append("║     WEBVIRT ENGINE - PERFORMANCE REPORT          ║\n");
-        report.append("╠══════════════════════════════════════════════════╣\n");
-
-        // Tiempos
-        report.append(String.format("║ Session duration:     %8d ms              ║\n", sessionDuration));
-        report.append(String.format("║ Total assets loaded:  %8d                  ║\n", totalAssetsLoaded));
-        report.append(String.format("║ Total load time:      %8d ms              ║\n", totalLoadTimeMs));
-        report.append(String.format("║ Avg load time:        %8d ms              ║\n",
-            totalAssetsLoaded > 0 ? totalLoadTimeMs / totalAssetsLoaded : 0));
-        report.append(String.format("║ Min load time:        %8d ms              ║\n",
-            minLoadTimeMs != Long.MAX_VALUE ? minLoadTimeMs : 0));
-        report.append(String.format("║ Max load time:        %8d ms              ║\n", maxLoadTimeMs));
-        report.append("╠══════════════════════════════════════════════════╣\n");
-
-        // Caché
-        double cacheHitRate = totalAssetsLoaded > 0 ?
-            (double) totalCacheHits / totalAssetsLoaded * 100 : 0;
-        report.append(String.format("║ Cache hits:           %8d                  ║\n", totalCacheHits));
-        report.append(String.format("║ Cache misses:         %8d                  ║\n", totalCacheMisses));
-        report.append(String.format("║ Cache hit rate:       %7.1f%%                 ║\n", cacheHitRate));
-        report.append(String.format("║ Bytes from cache:     %8d bytes           ║\n", totalBytesFromCache));
-        report.append(String.format("║ Total bytes loaded:   %8d bytes           ║\n", totalBytesLoaded));
-
-        if (totalBytesLoaded > 0) {
-            double cacheByteRate = (double) totalBytesFromCache / totalBytesLoaded * 100;
-            report.append(String.format("║ Cache byte rate:      %7.1f%%                 ║\n", cacheByteRate));
-        }
-        report.append("╠══════════════════════════════════════════════════╣\n");
-
-        // Errores y fallbacks
-        report.append(String.format("║ HTTP errors:          %8d                  ║\n", httpErrors));
-        report.append(String.format("║ SPA fallbacks:        %8d                  ║\n", spaFallbacks));
-        report.append(String.format("║ Range requests:       %8d                  ║\n", rangeRequests));
-        report.append("╠══════════════════════════════════════════════════╣\n");
-
-        // Desglose por tipo MIME
-        report.append("║ BY MIME TYPE:                                    ║\n");
-        synchronized (assetsByType) {
-            for (Map.Entry<String, Integer> entry : assetsByType.entrySet()) {
-                String type = entry.getKey();
-                int count = entry.getValue();
-                long totalTime = loadTimeByType.getOrDefault(type, 0L);
-                long avgTime = count > 0 ? totalTime / count : 0;
-                report.append(String.format("║   %-20s x%-4d avg %4dms           ║\n",
-                    type, count, avgTime));
-            }
-        }
-        report.append("╠══════════════════════════════════════════════════╣\n");
-
-        // Últimas cargas
-        report.append("║ RECENT LOADS (last 5):                           ║\n");
-        synchronized (recentLoads) {
-            int start = Math.max(0, recentLoads.size() - 5);
-            for (int i = start; i < recentLoads.size(); i++) {
-                AssetLoadRecord record = recentLoads.get(i);
-                String shortPath = record.path.length() > 35 ?
-                    "..." + record.path.substring(record.path.length() - 32) :
-                    record.path;
-                report.append(String.format("║   %s %s %dms║\n",
-                    record.fromCache ? "💾" : "📄",
-                    String.format("%-32s", shortPath),
-                    record.loadTimeMs
-                ));
-            }
-        }
-
-        report.append("╚══════════════════════════════════════════════════╝\n");
-
-        String reportStr = report.toString();
-        LoggingUtil.logToFile(context, reportStr);
-
-        return reportStr;
-    }
-
-    @Override
-    public String generateSummary() {
-        if (totalAssetsLoaded == 0) return "Sin datos de métricas";
-
-        double cacheHitRate = totalAssetsLoaded > 0 ?
-            (double) totalCacheHits / totalAssetsLoaded * 100 : 0;
-
-        long avgLoadTime = totalAssetsLoaded > 0 ?
-            totalLoadTimeMs / totalAssetsLoaded : 0;
-
-        long sessionDuration = getSessionDuration();
-
-        return String.format(
-            "📊 %d assets | %.0f%% cache | %dms avg | %d errors | %dms total",
-            totalAssetsLoaded,
-            cacheHitRate,
-            avgLoadTime,
-            httpErrors,
-            sessionDuration
-        );
-    }
-
-    @Override
-    public void reset() {
-        sessionStartTime = 0;
-        sessionEndTime = 0;
-        totalBytesLoaded = 0;
-        totalBytesFromCache = 0;
-        totalCacheHits = 0;
-        totalCacheMisses = 0;
-        totalAssetsLoaded = 0;
-        totalLoadTimeMs = 0;
-        minLoadTimeMs = Long.MAX_VALUE;
-        maxLoadTimeMs = 0;
-        httpErrors = 0;
-        spaFallbacks = 0;
-        rangeRequests = 0;
-        synchronized (assetsByType) {
-            assetsByType.clear();
-            loadTimeByType.clear();
-        }
-        synchronized (recentLoads) {
-            recentLoads.clear();
-        }
-    }
-
-    // ==================== GETTERS ====================
-
-    @Override
-    public List<AssetLoadRecord> getRecentLoads() {
-        synchronized (recentLoads) {
-            return new ArrayList<>(recentLoads);
-        }
-    }
-
-    public long getSessionDuration() {
-        if (sessionEndTime > 0) {
-            return sessionEndTime - sessionStartTime;
-        }
-        return sessionStartTime > 0 ?
-            SystemClock.elapsedRealtime() - sessionStartTime : 0;
-    }
-
-    public int getTotalAssetsLoaded() {
-        return totalAssetsLoaded;
-    }
-
-    public int getTotalCacheHits() {
-        return totalCacheHits;
-    }
-
-    public int getTotalCacheMisses() {
-        return totalCacheMisses;
-    }
-
-    public double getCacheHitRate() {
-        if (totalAssetsLoaded == 0) return 0;
-        return (double) totalCacheHits / totalAssetsLoaded * 100;
-    }
-
-    public long getAverageLoadTimeMs() {
-        if (totalAssetsLoaded == 0) return 0;
-        return totalLoadTimeMs / totalAssetsLoaded;
-    }
-
-    public long getTotalBytesLoaded() {
-        return totalBytesLoaded;
-    }
-
-    public int getHttpErrors() {
-        return httpErrors;
-    }
-
-    public int getSpaFallbacks() {
-        return spaFallbacks;
-    }
-
-    public int getRangeRequests() {
-        return rangeRequests;
-    }
-
-    // ==================== HELPERS ====================
-
-    private static String extractMimeType(String path) {
-        if (path == null) return "unknown";
-        int dot = path.lastIndexOf('.');
-        if (dot < 0) return "HTML";
-
-        String ext = path.substring(dot + 1).toLowerCase();
-        switch (ext) {
-            case "html": case "htm": return "HTML";
-            case "css": return "CSS";
-            case "js": case "mjs": return "JavaScript";
-            case "json": case "map": return "JSON";
-            case "png": case "jpg": case "jpeg":
-            case "gif": case "svg": case "webp":
-            case "ico": case "bmp": return "Image";
-            case "woff": case "woff2":
-            case "ttf": case "otf": case "eot": return "Font";
-            case "mp4": case "webm": return "Video";
-            case "mp3": case "ogg": case "wav": return "Audio";
-            case "wasm": return "WASM";
-            default: return ext.toUpperCase();
-        }
-    }
+	
+	private static final String TAG = "WebVirtMetrics";
+	private static final int MAX_RECENT_LOADS = 100;
+	
+	// Session tracking
+	private long sessionStartTime;
+	private long sessionEndTime = 0;
+	private boolean sessionEnded = false;
+	private boolean sessionStarted = false;
+	
+	// Asset counters
+	private final AtomicInteger totalAssetsLoaded = new AtomicInteger(0);
+	private final AtomicInteger totalCacheHits = new AtomicInteger(0);
+	private final AtomicInteger totalCacheMisses = new AtomicInteger(0);
+	private final AtomicLong totalBytesServed = new AtomicLong(0);
+	
+	// Timing
+	private final AtomicLong totalLoadTimeMs = new AtomicLong(0);
+	private long minLoadTimeMs = Long.MAX_VALUE;
+	private long maxLoadTimeMs = Long.MIN_VALUE;
+	private final Object timingLock = new Object();
+	
+	// Special counters
+	private final AtomicInteger rangeRequests = new AtomicInteger(0);
+	private final AtomicInteger spaFallbacks = new AtomicInteger(0);
+	private final AtomicInteger httpErrors = new AtomicInteger(0);
+	
+	// Recent loads (thread-safe limited list)
+	private final List<AssetLoadRecord> recentLoads =
+	Collections.synchronizedList(new ArrayList<>(MAX_RECENT_LOADS));
+	
+	private static final SimpleDateFormat TIMESTAMP_FORMAT =
+	new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US);
+	
+	public WebVirtMetrics() {
+		// Session will start when startSession() is called
+		LoggingUtil.logToFileStatic("[WebVirtMetrics] Instance created");
+	}
+	
+	// ==================== SESSION MANAGEMENT ====================
+	
+	@Override
+	public void startSession() {
+		if (sessionStarted) {
+			LoggingUtil.logToFileStatic("[WebVirtMetrics] WARN: Session already started");
+			return;
+		}
+		
+		sessionStarted = true;
+		sessionEnded = false;
+		sessionStartTime = System.currentTimeMillis();
+		
+		LoggingUtil.logToFileStatic(
+		"[WebVirtMetrics] Session started at " + formatTimestamp(sessionStartTime)
+		);
+	}
+	
+	@Override
+	public void endSession() {
+		if (!sessionStarted) {
+			LoggingUtil.logToFileStatic("[WebVirtMetrics] WARN: Session not started yet");
+			return;
+		}
+		
+		if (sessionEnded) {
+			LoggingUtil.logToFileStatic("[WebVirtMetrics] WARN: Session already ended");
+			return;
+		}
+		
+		sessionEnded = true;
+		sessionEndTime = System.currentTimeMillis();
+		
+		LoggingUtil.logToFileStatic(
+		"[WebVirtMetrics] Session ended at " + formatTimestamp(sessionEndTime)
+		);
+		LoggingUtil.logToFileStatic(
+		"[WebVirtMetrics] Session duration: " + getSessionDurationFormatted()
+		);
+	}
+	
+	// ==================== RECORDING METHODS ====================
+	
+	@Override
+	public void recordAssetLoad(String path, long loadTimeMs, boolean fromCache, long fileSize) {
+		int count = totalAssetsLoaded.incrementAndGet();
+		
+		LoggingUtil.logToFileStatic(
+		String.format("[WebVirtMetrics] ASSET #%d: path=%s | time=%dms | cache=%s | size=%d",
+		count, path, loadTimeMs, fromCache, fileSize)
+		);
+		
+		if (fromCache) {
+			totalCacheHits.incrementAndGet();
+			} else {
+			totalCacheMisses.incrementAndGet();
+		}
+		
+		totalBytesServed.addAndGet(fileSize);
+		totalLoadTimeMs.addAndGet(loadTimeMs);
+		
+		synchronized (timingLock) {
+			if (loadTimeMs < minLoadTimeMs) minLoadTimeMs = loadTimeMs;
+			if (loadTimeMs > maxLoadTimeMs) maxLoadTimeMs = loadTimeMs;
+		}
+		
+		// Add to recent loads
+		if (recentLoads.size() < MAX_RECENT_LOADS) {
+			recentLoads.add(new AssetLoadRecord(path, null, loadTimeMs, fromCache, fileSize));
+		}
+	}
+	
+	@Override
+	public void recordHttpError() {
+		int count = httpErrors.incrementAndGet();
+		LoggingUtil.logToFileStatic("[WebVirtMetrics] HTTP_ERROR #" + count);
+	}
+	
+	@Override
+	public void recordSpaFallback() {
+		int count = spaFallbacks.incrementAndGet();
+		LoggingUtil.logToFileStatic("[WebVirtMetrics] SPA_FALLBACK #" + count);
+	}
+	
+	@Override
+	public void recordRangeRequest() {
+		int count = rangeRequests.incrementAndGet();
+		LoggingUtil.logToFileStatic("[WebVirtMetrics] RANGE_REQUEST #" + count);
+	}
+	
+	// ==================== REPORT GENERATION ====================
+	
+	@Override
+	public String generateReport(@NonNull Context context) {
+		if (context == null) {
+			String error = "Context is null, cannot generate report";
+			LoggingUtil.logToFileStatic("[WebVirtMetrics] ERROR: " + error);
+			return error;
+		}
+		
+		LoggingUtil.logToFileStatic("[WebVirtMetrics] Generating report...");
+		
+		try {
+			int totalAssets = totalAssetsLoaded.get();
+			LoggingUtil.logToFileStatic(
+			"[WebVirtMetrics] Total assets to report: " + totalAssets
+			);
+			
+			if (totalAssets == 0) {
+				String msg = "No assets loaded yet. Start a session and load some content.";
+				LoggingUtil.logToFileStatic("[WebVirtMetrics] " + msg);
+				return msg;
+			}
+			
+			String report = buildReportString();
+			
+			// Write to file
+			File documentsDir = context.getExternalFilesDir(null);
+			if (documentsDir == null) {
+				documentsDir = context.getFilesDir();
+				LoggingUtil.logToFileStatic(
+				"[WebVirtMetrics] Using internal storage: " + documentsDir.getAbsolutePath()
+				);
+				} else {
+				LoggingUtil.logToFileStatic(
+				"[WebVirtMetrics] Using external storage: " + documentsDir.getAbsolutePath()
+				);
+			}
+			
+			File reportFile = new File(documentsDir, "webvirt_metrics.txt");
+			LoggingUtil.logToFileStatic(
+			"[WebVirtMetrics] Writing report to: " + reportFile.getAbsolutePath()
+			);
+			
+			// Create directory if needed
+			File parentDir = reportFile.getParentFile();
+			if (parentDir != null && !parentDir.exists()) {
+				boolean created = parentDir.mkdirs();
+				LoggingUtil.logToFileStatic(
+				"[WebVirtMetrics] Creating directory: " + parentDir.getAbsolutePath() +
+				" | success=" + created
+				);
+			}
+			
+			// Write report (overwrite mode for clean metrics report)
+			try (FileWriter fw = new FileWriter(reportFile, false);
+			PrintWriter pw = new PrintWriter(fw)) {
+				pw.print(report);
+				pw.flush();
+				
+				LoggingUtil.logToFileStatic(
+				"[WebVirtMetrics] Report written successfully | size=" + report.length() + " chars"
+				);
+			}
+			
+			// Verify file was written
+			if (reportFile.exists()) {
+				long fileSize = reportFile.length();
+				LoggingUtil.logToFileStatic(
+				"[WebVirtMetrics] VERIFIED: File exists | path=" + reportFile.getAbsolutePath() +
+				" | size=" + fileSize + " bytes"
+				);
+				} else {
+				LoggingUtil.logToFileStatic(
+				"[WebVirtMetrics] ERROR: File does not exist after write attempt!"
+				);
+			}
+			
+			return report;
+			
+			} catch (IOException e) {
+			String error = "IOException generating report: " + e.getMessage();
+			LoggingUtil.logToFileStatic("[WebVirtMetrics] ERROR: " + error);
+			LoggingUtil.logToFileStatic("[WebVirtMetrics] Stack trace: " +
+			Log.getStackTraceString(e));
+			return error;
+			} catch (Exception e) {
+			String error = "Unexpected error generating report: " + e.getMessage();
+			LoggingUtil.logToFileStatic("[WebVirtMetrics] ERROR: " + error);
+			LoggingUtil.logToFileStatic("[WebVirtMetrics] Stack trace: " +
+			Log.getStackTraceString(e));
+			return error;
+		}
+	}
+	
+	@Override
+	public String generateSummary() {
+		int total = totalAssetsLoaded.get();
+		if (total == 0) {
+			return "No assets loaded yet";
+		}
+		
+		return String.format(
+		"Assets: %d | Cache: %d (%.0f%%) | Time: %s | Size: %s",
+		total,
+		totalCacheHits.get(),
+		getCacheHitRate(),
+		getSessionDurationFormatted(),
+		formatBytes(totalBytesServed.get())
+		);
+	}
+	
+	@Override
+	public void reset() {
+		LoggingUtil.logToFileStatic("[WebVirtMetrics] Resetting all metrics");
+		
+		totalAssetsLoaded.set(0);
+		totalCacheHits.set(0);
+		totalCacheMisses.set(0);
+		totalBytesServed.set(0);
+		totalLoadTimeMs.set(0);
+		
+		synchronized (timingLock) {
+			minLoadTimeMs = Long.MAX_VALUE;
+			maxLoadTimeMs = Long.MIN_VALUE;
+		}
+		
+		rangeRequests.set(0);
+		spaFallbacks.set(0);
+		httpErrors.set(0);
+		
+		recentLoads.clear();
+		
+		sessionStartTime = 0;
+		sessionEndTime = 0;
+		sessionEnded = false;
+		sessionStarted = false;
+		
+		LoggingUtil.logToFileStatic("[WebVirtMetrics] All metrics reset");
+	}
+	
+	@Override
+	public List<AssetLoadRecord> getRecentLoads() {
+		synchronized (recentLoads) {
+			return new ArrayList<>(recentLoads);
+		}
+	}
+	
+	// ==================== GETTERS ====================
+	
+	public int getTotalAssetsLoaded() {
+		return totalAssetsLoaded.get();
+	}
+	
+	public int getCacheHits() {
+		return totalCacheHits.get();
+	}
+	
+	public int getCacheMisses() {
+		return totalCacheMisses.get();
+	}
+	
+	public double getCacheHitRate() {
+		int total = totalAssetsLoaded.get();
+		return total > 0 ? (totalCacheHits.get() * 100.0) / total : 0.0;
+	}
+	
+	public long getTotalBytesServed() {
+		return totalBytesServed.get();
+	}
+	
+	public long getAverageLoadTimeMs() {
+		int total = totalAssetsLoaded.get();
+		return total > 0 ? totalLoadTimeMs.get() / total : 0;
+	}
+	
+	public long getSessionDurationMs() {
+		long end = sessionEndTime > 0 ? sessionEndTime : System.currentTimeMillis();
+		long start = sessionStartTime > 0 ? sessionStartTime : System.currentTimeMillis();
+		return end - start;
+	}
+	
+	public boolean isSessionEnded() {
+		return sessionEnded;
+	}
+	
+	public boolean isSessionStarted() {
+		return sessionStarted;
+	}
+	
+	public int getRangeRequests() {
+		return rangeRequests.get();
+	}
+	
+	public int getSpaFallbacks() {
+		return spaFallbacks.get();
+	}
+	
+	public int getHttpErrors() {
+		return httpErrors.get();
+	}
+	
+	// ==================== PRIVATE HELPERS ====================
+	
+	private String buildReportString() {
+		StringBuilder sb = new StringBuilder();
+		
+		sb.append("╔══════════════════════════════════════════════════════╗\n");
+		sb.append("║         WEBVIRT RUNTIME METRICS REPORT              ║\n");
+		sb.append("╠══════════════════════════════════════════════════════╣\n");
+		sb.append("\n");
+		
+		// Session info
+		sb.append("📅 SESSION INFO\n");
+		sb.append("─────────────────────────────────────────────────\n");
+		if (sessionStartTime > 0) {
+			sb.append("  Started:     ").append(formatTimestamp(sessionStartTime)).append("\n");
+		}
+		if (sessionEndTime > 0) {
+			sb.append("  Ended:       ").append(formatTimestamp(sessionEndTime)).append("\n");
+			sb.append("  Duration:    ").append(getSessionDurationFormatted()).append("\n");
+		}
+		sb.append("\n");
+		
+		// Asset loading stats
+		sb.append("📦 ASSET LOADING\n");
+		sb.append("─────────────────────────────────────────────────\n");
+		sb.append(String.format("  Total:       %d\n", totalAssetsLoaded.get()));
+		sb.append(String.format("  From cache:  %d (%.1f%%)\n",
+		totalCacheHits.get(), getCacheHitRate()));
+		sb.append(String.format("  From disk:   %d (%.1f%%)\n",
+		totalCacheMisses.get(), 100.0 - getCacheHitRate()));
+		sb.append("\n");
+		
+		// Data transfer
+		sb.append("📊 DATA TRANSFER\n");
+		sb.append("─────────────────────────────────────────────────\n");
+		sb.append(String.format("  Total:       %s\n", formatBytes(totalBytesServed.get())));
+		if (totalAssetsLoaded.get() > 0) {
+			sb.append(String.format("  Avg/asset:   %s\n",
+			formatBytes(totalBytesServed.get() / totalAssetsLoaded.get())));
+		}
+		sb.append("\n");
+		
+		// Performance
+		sb.append("⚡ PERFORMANCE\n");
+		sb.append("─────────────────────────────────────────────────\n");
+		if (totalAssetsLoaded.get() > 0) {
+			sb.append(String.format("  Avg time:    %d ms\n",
+			totalLoadTimeMs.get() / totalAssetsLoaded.get()));
+			synchronized (timingLock) {
+				if (minLoadTimeMs != Long.MAX_VALUE) {
+					sb.append(String.format("  Min time:    %d ms\n", minLoadTimeMs));
+				}
+				if (maxLoadTimeMs != Long.MIN_VALUE) {
+					sb.append(String.format("  Max time:    %d ms\n", maxLoadTimeMs));
+				}
+			}
+			sb.append(String.format("  Total time:  %d ms\n", totalLoadTimeMs.get()));
+		}
+		sb.append("\n");
+		
+		// Special requests
+		sb.append("🔧 SPECIAL REQUESTS\n");
+		sb.append("─────────────────────────────────────────────────\n");
+		sb.append(String.format("  Range:       %d\n", rangeRequests.get()));
+		sb.append(String.format("  SPA fallback: %d\n", spaFallbacks.get()));
+		sb.append(String.format("  HTTP errors:  %d\n", httpErrors.get()));
+		sb.append("\n");
+		
+		// Footer
+		sb.append("╚══════════════════════════════════════════════════════╝\n");
+		sb.append("Generated: ").append(formatTimestamp(System.currentTimeMillis())).append("\n");
+		sb.append("WebVirt v3.5.1 — Hybrid Web Runtime Engine\n");
+		
+		return sb.toString();
+	}
+	
+	private String formatTimestamp(long timestamp) {
+		TIMESTAMP_FORMAT.setTimeZone(TimeZone.getDefault());
+		return TIMESTAMP_FORMAT.format(new Date(timestamp));
+	}
+	
+	private String getSessionDurationFormatted() {
+		long ms = getSessionDurationMs();
+		if (ms < 1000) return ms + " ms";
+		if (ms < 60000) return String.format("%.1f sec", ms / 1000.0);
+		long minutes = ms / 60000;
+		long seconds = (ms % 60000) / 1000;
+		return String.format("%d min %d sec", minutes, seconds);
+	}
+	
+	private String formatBytes(long bytes) {
+		if (bytes < 1024) return bytes + " B";
+		if (bytes < 1024 * 1024) return String.format("%.1f KB", bytes / 1024.0);
+		if (bytes < 1024 * 1024 * 1024) return String.format("%.1f MB", bytes / (1024.0 * 1024));
+		return String.format("%.2f GB", bytes / (1024.0 * 1024 * 1024));
+	}
 }

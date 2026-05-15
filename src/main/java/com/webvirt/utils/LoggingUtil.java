@@ -1,128 +1,140 @@
 package com.webvirt.utils;
 
-import android.content.ContentValues;
 import android.content.Context;
-import android.net.Uri;
-import android.os.Environment;
-import android.provider.MediaStore;
+import android.util.Log;
 
-import java.io.OutputStream;
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.PrintWriter;
 import java.text.SimpleDateFormat;
 import java.util.Date;
+import java.util.Locale;
 
+/**
+* LoggingUtil v3.5.3 — Auto-inicializable, sin permisos, Android 11+.
+*
+* NO requiere permisos. Usa almacenamiento externo privado de la app.
+* Compatible con logToFileStatic() sin init() previo gracias a
+* inicialización lazy desde WebVirt.
+*/
 public class LoggingUtil {
-	private static final String LOG_FILENAME = "app_logs.txt";
-	private static Uri logFileUri = null;
 	
-	public static void logToFile(Context context, String message) {
-		String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date());
-		String logMessage = timestamp + " - " + message + "\n";
+	private static final String TAG = "LoggingUtil";
+	private static final String LOG_FILENAME = "webvirt_metrics.txt";
+	
+	// Contexto estático para logToFileStatic()
+	private static Context appContext;
+	
+	/**
+	* Inicialización explícita (opcional pero recomendada).
+	* Si no se llama, logToFileStatic() usará inicialización lazy.
+	*/
+	public static void init(Context context) {
+		if (context != null) {
+			appContext = context.getApplicationContext();
+			Log.d(TAG, "✅ Inicializado: " + appContext.getPackageName());
+		}
+	}
+	
+	/**
+	* Escribe un mensaje al archivo de log.
+	* Auto-inicializa si no se llamó a init() antes.
+	* Usado por WebVirtMetrics.
+	*/
+	public static synchronized void logToFileStatic(String message) {
+		// Siempre loguear a Logcat
+		Log.d(TAG, message);
+		
+		// Si no hay contexto, no podemos escribir a archivo
+		if (appContext == null) {
+			Log.w(TAG, "⚠️ Contexto no disponible para: " + message);
+			return;
+		}
+		
+		writeToFile(appContext, message);
+	}
+	
+	/**
+	* Escribe un mensaje al archivo de log usando el contexto proporcionado.
+	* Usado por WebVirtFileLoader.
+	*/
+	public static synchronized void logToFile(Context context, String message) {
+		// Siempre loguear a Logcat
+		Log.d(TAG, message);
+		
+		if (context == null) {
+			Log.w(TAG, "⚠️ Contexto null para: " + message);
+			return;
+		}
+		
+		// Guardar contexto para futuros logToFileStatic()
+		if (appContext == null) {
+			appContext = context.getApplicationContext();
+		}
+		
+		writeToFile(context, message);
+	}
+	
+	/**
+	* Escritura real al archivo.
+	* NO requiere permisos - usa almacenamiento externo privado.
+	*/
+	private static void writeToFile(Context context, String message) {
+		File logFile = null;
 		
 		try {
-			// Si no tenemos la URI del archivo, intentar encontrarlo o crearlo
-			if (logFileUri == null) {
-				logFileUri = findLogFile(context);
+			// Usar almacenamiento externo privado (NO requiere permisos)
+			File filesDir = context.getExternalFilesDir(null);
+			
+			// Fallback a almacenamiento interno si externo no disponible
+			if (filesDir == null) {
+				filesDir = context.getFilesDir();
+				Log.d(TAG, "Usando almacenamiento interno");
 			}
 			
-			// Si no existe el archivo, crearlo
-			if (logFileUri == null) {
-				logFileUri = createLogFile(context);
+			// Crear directorio si no existe
+			if (!filesDir.exists()) {
+				filesDir.mkdirs();
 			}
 			
-			// Escribir en el archivo (modo append)
-			if (logFileUri != null) {
-				try (OutputStream outputStream = context.getContentResolver().openOutputStream(logFileUri, "wa")) {
-					if (outputStream != null) {
-						outputStream.write(logMessage.getBytes());
-						outputStream.flush();
-					}
-				}
+			logFile = new File(filesDir, LOG_FILENAME);
+			
+			// Formatear mensaje con timestamp
+			String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+			.format(new Date());
+			String logMessage = timestamp + " " + message + "\n";
+			
+			// Escribir en modo append
+			FileWriter fw = new FileWriter(logFile, true);
+			PrintWriter pw = new PrintWriter(fw);
+			pw.print(logMessage);
+			pw.flush();
+			pw.close();
+			
+			} catch (IOException e) {
+			Log.e(TAG, "❌ Error escribiendo log: " + e.getMessage());
+			
+			// Fallback a almacenamiento interno
+			try {
+				File fallbackDir = context.getFilesDir();
+				File fallbackFile = new File(fallbackDir, LOG_FILENAME);
+				FileWriter fw = new FileWriter(fallbackFile, true);
+				PrintWriter pw = new PrintWriter(fw);
+				pw.print(message + "\n");
+				pw.flush();
+				pw.close();
+				Log.d(TAG, "✅ Fallback log escrito en: " + fallbackFile.getAbsolutePath());
+				} catch (IOException e2) {
+				Log.e(TAG, "❌ Fallback también falló: " + e2.getMessage());
 			}
-			} catch (Exception e) {
-			e.printStackTrace();
-			// Resetear la URI para forzar recreación en el próximo log
-			logFileUri = null;
 		}
 	}
 	
-	private static Uri createLogFile(Context context) {
-		ContentValues values = new ContentValues();
-		values.put(MediaStore.Files.FileColumns.DISPLAY_NAME, LOG_FILENAME);
-		values.put(MediaStore.Files.FileColumns.MIME_TYPE, "text/plain");
-		values.put(MediaStore.Files.FileColumns.RELATIVE_PATH, Environment.DIRECTORY_DOCUMENTS);
-		
-		try {
-			Uri uri = context.getContentResolver().insert(MediaStore.Files.getContentUri("external"), values);
-			
-			// Escribir header inicial
-			if (uri != null) {
-				try (OutputStream outputStream = context.getContentResolver().openOutputStream(uri)) {
-					if (outputStream != null) {
-						String header = "=== APPLICATION LOGS ===\n" +
-						"Created: " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()) + "\n" +
-						"========================\n\n";
-						outputStream.write(header.getBytes());
-						outputStream.flush();
-					}
-				}
-			}
-			return uri;
-			} catch (Exception e) {
-			e.printStackTrace();
-			return null;
-		}
-	}
-	
-	private static Uri findLogFile(Context context) {
-		try {
-			// Buscar el archivo de logs por nombre
-			Uri collection = MediaStore.Files.getContentUri("external");
-			String[] projection = { MediaStore.Files.FileColumns._ID };
-			String selection = MediaStore.Files.FileColumns.RELATIVE_PATH + " LIKE ? AND " +
-			MediaStore.Files.FileColumns.DISPLAY_NAME + " = ?";
-			String[] selectionArgs = new String[] {
-				"%" + Environment.DIRECTORY_DOCUMENTS + "%",
-				LOG_FILENAME
-			};
-			
-			android.database.Cursor cursor = context.getContentResolver().query(
-			collection, projection, selection, selectionArgs, null);
-			
-			if (cursor != null && cursor.moveToFirst()) {
-				long id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID));
-				cursor.close();
-				return Uri.withAppendedPath(collection, String.valueOf(id));
-			}
-			if (cursor != null) {
-				cursor.close();
-			}
-			} catch (Exception e) {
-			e.printStackTrace();
-		}
-		return null;
-	}
-	
-	// Método para limpiar el archivo de logs (opcional)
-	public static void clearLogs(Context context) {
-		try {
-			if (logFileUri != null) {
-				// Eliminar el archivo existente
-				context.getContentResolver().delete(logFileUri, null, null);
-				logFileUri = null;
-				
-				// Crear uno nuevo vacío
-				logFileUri = createLogFile(context);
-			}
-			} catch (Exception e) {
-			e.printStackTrace();
-		}
-	}
-	
-	// Método para obtener la URI del archivo de logs (útil para compartir o visualizar)
-	public static Uri getLogFileUri(Context context) {
-		if (logFileUri == null) {
-			logFileUri = findLogFile(context);
-		}
-		return logFileUri;
+	/**
+	* Verifica si el logging está listo para escribir.
+	*/
+	public static boolean isReady() {
+		return appContext != null;
 	}
 }
